@@ -1,0 +1,84 @@
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+import warnings
+warnings.filterwarnings("ignore")
+def generate_data(n_steps=1500):
+    t = np.arange(n_steps)
+
+    energy = 0.05 * t + 10*np.sin(2*np.pi*t/24) + np.random.normal(0,1,n_steps)
+    temperature = 20 + 5*np.sin(2*np.pi*t/365) + np.random.normal(0,0.5,n_steps)
+    humidity = 50 + 10*np.sin(2*np.pi*t/48) + np.random.normal(0,2,n_steps)
+
+    data = np.vstack([energy, temperature, humidity]).T
+    return pd.DataFrame(data, columns=["energy","temp","humidity"])
+def create_sequences(data, lookback=48, horizon=1):
+    X, y = [], []
+    for i in range(len(data)-lookback-horizon):
+        X.append(data[i:i+lookback])
+        y.append(data[i+lookback:i+lookback+horizon,0])
+    return np.array(X), np.array(y)
+def transformer_model(input_shape, horizon):
+    inputs = layers.Input(shape=input_shape)
+
+    x = layers.Dense(64)(inputs)
+    attn = layers.MultiHeadAttention(num_heads=4, key_dim=64)(x, x)
+    x = layers.LayerNormalization()(x + attn)
+
+    x = layers.GlobalAveragePooling1D()(x)
+    outputs = layers.Dense(horizon)(x)
+
+    model = models.Model(inputs, outputs)
+    model.compile(optimizer="adam", loss="mse")
+    return model
+def lstm_model(input_shape, horizon):
+    model = models.Sequential([
+        layers.LSTM(64, return_sequences=False, input_shape=input_shape),
+        layers.Dense(horizon)
+    ])
+    model.compile(optimizer="adam", loss="mse")
+    return model
+def sarimax_forecast(train, test):
+    model = SARIMAX(train, order=(2,1,2), seasonal_order=(1,1,1,24))
+    fitted = model.fit(disp=False)
+    return fitted.forecast(len(test))
+def evaluate(y_true, y_pred):
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae = mean_absolute_error(y_true, y_pred)
+    mape = np.mean(np.abs((y_true-y_pred)/y_true))*100
+    return rmse, mae, mape
+df = generate_data()
+scaler = MinMaxScaler()
+scaled = scaler.fit_transform(df)
+
+LOOKBACK = 48
+HORIZON = 10
+
+X, y = create_sequences(scaled, LOOKBACK, HORIZON)
+
+split = int(0.8 * len(X))
+X_train, X_test = X[:split], X[split:]
+y_train, y_test = y[:split], y[split:]
+
+# Transformer
+transformer = transformer_model(X_train.shape[1:], HORIZON)
+transformer.fit(X_train, y_train, epochs=10, batch_size=32, verbose=0)
+pred_t = transformer.predict(X_test)
+
+# LSTM
+lstm = lstm_model(X_train.shape[1:], HORIZON)
+lstm.fit(X_train, y_train, epochs=10, batch_size=32, verbose=0)
+pred_l = lstm.predict(X_test)
+
+# SARIMAX (1-step)
+train_series = df["energy"][:split+LOOKBACK]
+test_series = df["energy"][split+LOOKBACK:]
+pred_s = sarimax_forecast(train_series, test_series)
+
+print("Transformer:", evaluate(y_test[:,0], pred_t[:,0]))
+print("LSTM:", evaluate(y_test[:,0], pred_l[:,0]))
+print("SARIMAX:", evaluate(test_series.values, pred_s))
